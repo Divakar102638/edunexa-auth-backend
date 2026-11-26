@@ -1,13 +1,14 @@
+import { Datastore } from '@zcatalyst/datastore';
 import { esc } from '../utils/esc.js';
 
 export async function findUserByCatalystUserId(catalystApp, catalystUserId) {
-  const zcql = catalystApp.zcql();
+  const datastore = new Datastore(catalystApp);
   const query = `
     SELECT ROWID, catalystUserId, email, status, userType
     FROM users
     WHERE catalystUserId = '${esc(catalystUserId)}'
   `;
-  const rows = await zcql.executeZCQLQuery(query);
+  const rows = await datastore.executeZCQLQuery(query);
   if (!rows?.length) return null;
 
   const row = rows[0].users || rows[0].Users || rows[0];
@@ -21,13 +22,13 @@ export async function findUserByCatalystUserId(catalystApp, catalystUserId) {
 }
 
 export async function findUserByRowId(catalystApp, rowId) {
-  const zcql = catalystApp.zcql();
+  const datastore = new Datastore(catalystApp);
   const query = `
     SELECT ROWID, catalystUserId, email, status, userType
     FROM users
     WHERE ROWID = '${esc(rowId)}'
   `;
-  const rows = await zcql.executeZCQLQuery(query);
+  const rows = await datastore.executeZCQLQuery(query);
   if (!rows?.length) return null;
 
   const row = rows[0].users || rows[0].Users || rows[0];

@@ -2,8 +2,10 @@ import { v4 as uuidv4 } from 'uuid';
 import { initializeCatalyst } from '../catalyst.js';
 import { config } from '../config.js';
 import { signAccessToken, signRefreshToken, verifyRefreshToken } from '../utils/tokens.js';
-import { sha256, randomToken } from '../utils/crypto.js';
+import { sha256 } from '../utils/crypto.js';
 import { setWebAuthCookies, clearWebAuthCookies } from '../utils/cookies.js';
+import { createCsrfToken } from '../utils/csrfTokens.js';
+import { validateRefreshSession } from '../utils/sessionValidation.js';
 import { authError } from '../utils/response.js';
 import { validateCatalystRequestUser } from './catalystAuthVerifier.js';
 import { findUserByCatalystUserId, findUserByRowId } from '../repositories/usersRepo.js';
@@ -12,6 +14,7 @@ import {
   insertSession,
   findSessionBySessionId,
   updateSessionByRowId,
+  compareAndSwapRefreshTokenHash,
   revokeSessionByRowId,
   revokeAllSessionsForUser,
   listSessionsForUser
@@ -51,16 +54,28 @@ async function audit(catalystApp, data) {
   });
 }
 
-function getDeviceType(req) {
-  return req.body?.deviceType || (req.cookies?.edunexa_refresh ? 'web' : 'mobile');
-}
-
 function getRefreshTokenFromRequest(req) {
   return req.body?.refreshToken || req.cookies?.edunexa_refresh || null;
 }
 
+async function rejectRefreshTokenReuse(catalystApp, session, req, res) {
+  await revokeAllSessionsForUser(catalystApp, session.userId, 'refresh_token_reuse_detected');
+
+  await audit(catalystApp, {
+    userId: session.userId,
+    institutionId: null,
+    eventType: 'REFRESH_TOKEN_REUSE_DETECTED',
+    entityId: session.sessionId,
+    description: 'Refresh token reuse detected.',
+    ipAddress: req.requestIp
+  });
+
+  clearWebAuthCookies(res);
+  return authError(res, 401, 'REFRESH_TOKEN_REUSE', 'Refresh token reuse detected.');
+}
+
 export async function exchangeCatalystIdentity(req, res) {
-  const catalystApp = initializeCatalyst(req);
+  const catalystApp = await initializeCatalyst(req);
   const verification = await validateCatalystRequestUser(catalystApp);
 
   if (!verification.ok) {
@@ -84,7 +99,7 @@ export async function exchangeCatalystIdentity(req, res) {
   const sessionId = uuidv4();
   const tokenFamilyId = uuidv4();
   const refreshTokenId = uuidv4();
-  const csrfToken = randomToken(24);
+  const csrfToken = req.body?.deviceType === 'web' ? createCsrfToken() : null;
 
   const sessionRecord = {
     sessionId,
@@ -148,7 +163,7 @@ export async function exchangeCatalystIdentity(req, res) {
 }
 
 export async function getCurrentSession(req, res) {
-  const catalystApp = initializeCatalyst(req);
+  const catalystApp = await initializeCatalyst(req);
   const user = await findUserByRowId(catalystApp, req.auth.sub);
   const memberships = await findActiveMembershipsByUserRowId(catalystApp, req.auth.sub);
 
@@ -173,7 +188,7 @@ export async function getCurrentSession(req, res) {
 }
 
 export async function refreshSession(req, res) {
-  const catalystApp = initializeCatalyst(req);
+  const catalystApp = await initializeCatalyst(req);
   const refreshToken = getRefreshTokenFromRequest(req);
 
   if (!refreshToken) {
@@ -187,31 +202,35 @@ export async function refreshSession(req, res) {
     return authError(res, 401, 'REFRESH_TOKEN_INVALID', 'Refresh token is invalid or expired.');
   }
 
-  const session = await findSessionBySessionId(catalystApp, payload.sessionId);
-  if (!session) {
-    return authError(res, 401, 'SESSION_NOT_FOUND', 'Session not found.');
+  if (
+    typeof payload?.sessionId !== 'string' ||
+    typeof payload?.sub !== 'string' ||
+    typeof payload?.tokenFamilyId !== 'string'
+  ) {
+    return authError(res, 401, 'REFRESH_TOKEN_INVALID', 'Refresh token is invalid or expired.');
   }
 
-  if (session.sessionStatus !== 'active') {
-    return authError(res, 401, 'SESSION_REVOKED', 'Session is no longer active.');
+  const session = await findSessionBySessionId(catalystApp, payload.sessionId);
+  const validationError = validateRefreshSession(session, payload);
+  if (validationError === 'SESSION_NOT_FOUND') {
+    return authError(res, 401, validationError, 'Session not found.');
+  }
+  if (validationError === 'SESSION_REVOKED') {
+    return authError(res, 401, validationError, 'Session is no longer active.');
+  }
+  if (validationError === 'SESSION_EXPIRED') {
+    await revokeSessionByRowId(catalystApp, session.ROWID, 'session_expired');
+    clearWebAuthCookies(res);
+    return authError(res, 401, validationError, 'Session has expired.');
+  }
+  if (validationError) {
+    return authError(res, 401, validationError, 'Refresh token is invalid or expired.');
   }
 
   const incomingHash = sha256(refreshToken);
 
   if (session.refreshTokenHash !== incomingHash) {
-    await revokeAllSessionsForUser(catalystApp, session.userId, 'refresh_token_reuse_detected');
-
-    await audit(catalystApp, {
-      userId: session.userId,
-      institutionId: null,
-      eventType: 'REFRESH_TOKEN_REUSE_DETECTED',
-      entityId: session.sessionId,
-      description: 'Refresh token reuse detected.',
-      ipAddress: req.requestIp
-    });
-
-    clearWebAuthCookies(res);
-    return authError(res, 401, 'REFRESH_TOKEN_REUSE', 'Refresh token reuse detected.');
+    return rejectRefreshTokenReuse(catalystApp, session, req, res);
   }
 
   const user = await findUserByRowId(catalystApp, session.userId);
@@ -239,14 +258,34 @@ export async function refreshSession(req, res) {
   });
 
   const newRefreshHash = sha256(newRefreshToken);
-
-  await updateSessionByRowId(catalystApp, {
-    ROWID: session.ROWID,
-    refreshTokenHash: newRefreshHash,
-    lastSeenAt: nowIso(),
-    rotatedFromSessionId: session.sessionId,
-    accessTokenVersion: nextAccessTokenVersion
+  const rotated = await compareAndSwapRefreshTokenHash(catalystApp, {
+    rowId: session.ROWID,
+    sessionId: session.sessionId,
+    expectedRefreshTokenHash: incomingHash,
+    newRefreshTokenHash: newRefreshHash
   });
+  if (!rotated) {
+    return rejectRefreshTokenReuse(catalystApp, session, req, res);
+  }
+
+  try {
+    await updateSessionByRowId(catalystApp, {
+      ROWID: session.ROWID,
+      lastSeenAt: nowIso(),
+      rotatedFromSessionId: session.sessionId,
+      accessTokenVersion: nextAccessTokenVersion
+    });
+  } catch (error) {
+    try {
+      await revokeSessionByRowId(catalystApp, session.ROWID, 'refresh_rotation_incomplete');
+    } catch (revocationError) {
+      throw new AggregateError(
+        [error, revocationError],
+        'Refresh rotation failed and its session could not be revoked.'
+      );
+    }
+    throw error;
+  }
 
   const accessToken = signAccessToken(buildAccessPayload(user, memberships, {
     ...session,
@@ -264,7 +303,7 @@ export async function refreshSession(req, res) {
 
   const isWeb = Boolean(req.cookies?.edunexa_refresh);
   if (isWeb) {
-    const csrfToken = req.cookies?.edunexa_csrf || randomToken(24);
+    const csrfToken = req.cookies.edunexa_csrf;
     setWebAuthCookies(res, accessToken, newRefreshToken, csrfToken);
     return res.json({
       session: {
@@ -286,7 +325,7 @@ export async function refreshSession(req, res) {
 }
 
 export async function logoutSession(req, res) {
-  const catalystApp = initializeCatalyst(req);
+  const catalystApp = await initializeCatalyst(req);
   const session = await findSessionBySessionId(catalystApp, req.auth.sessionId);
 
   if (session?.ROWID) {
@@ -306,7 +345,7 @@ export async function logoutSession(req, res) {
 }
 
 export async function logoutAllSessions(req, res) {
-  const catalystApp = initializeCatalyst(req);
+  const catalystApp = await initializeCatalyst(req);
   await revokeAllSessionsForUser(catalystApp, req.auth.sub, 'user_logout_all');
 
   await audit(catalystApp, {
@@ -323,9 +362,17 @@ export async function logoutAllSessions(req, res) {
 }
 
 export async function debugListSessions(req, res) {
-  const catalystApp = initializeCatalyst(req);
+  const catalystApp = await initializeCatalyst(req);
+  const actor = await findUserByRowId(catalystApp, req.auth.sub);
+  if (!actor || actor.status !== 'active' || actor.userType !== 'super_admin') {
+    return authError(res, 403, 'ADMIN_REQUIRED', 'Administrator access required.');
+  }
+
   const userId = req.query.userId;
   if (!userId) return authError(res, 400, 'USER_ID_REQUIRED', 'userId query parameter is required.');
+  if (!/^[A-Za-z0-9_-]+$/.test(String(userId))) {
+    return authError(res, 400, 'USER_ID_INVALID', 'userId query parameter is invalid.');
+  }
   const sessions = await listSessionsForUser(catalystApp, userId);
   return res.json({ sessions });
 }

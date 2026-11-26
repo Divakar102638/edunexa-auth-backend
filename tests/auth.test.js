@@ -1,10 +1,11 @@
-process.env.BACKEND_ACCESS_TOKEN_SECRET ||= 'test-access-secret-at-least-32-characters';
-process.env.BACKEND_REFRESH_TOKEN_SECRET ||= 'test-refresh-secret-at-least-32-characters';
+process.env.BACKEND_ACCESS_TOKEN_SECRET = 'test-access-secret-at-least-32-characters';
+process.env.BACKEND_REFRESH_TOKEN_SECRET = 'test-refresh-secret-at-least-32-characters';
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { signAccessToken, signRefreshToken, verifyAccessToken } from '../src/utils/tokens.js';
 import { sha256 } from '../src/utils/crypto.js';
+
+const { signAccessToken, signRefreshToken, verifyAccessToken } = await import('../src/utils/tokens.js');
 
 test('access token signs and verifies', () => {
   const token = signAccessToken({ sub: '1001', sessionId: 'sess1', atv: 1 });

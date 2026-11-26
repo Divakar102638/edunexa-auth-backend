@@ -15,17 +15,17 @@ This project is extracted from the corrected backend source supplied in the conv
 1. Use a NON-PRODUCTION Catalyst project only.
 2. Review the existing Catalyst schema. Required manual changes from the source: unique constraints on `users.catalystUserId`, `institutions.institutionId`, and `backend_sessions.sessionId`; add `backend_sessions.accessTokenVersion` as a number/integer defaulting to 1. Recommended searchable indexes: `institution_memberships.userId`, `backend_sessions.userId`, `backend_sessions.tokenFamilyId`. Do not recreate tables.
 3. Copy `.env.example` to `.env` and set long random secrets locally. Never commit `.env` or share secret values in chat.
-4. Install and test with Node.js 24: `npm install`, `npm test`, `npm run dev`.
+4. Install and test with Node.js 24: `npm ci`, `npm test`, `npm run dev`.
 5. Verify Catalyst Authentication request context end-to-end before enabling `/auth/exchange`. A local unauthenticated request should fail safely.
 
 ## Important security review required before production
 
-- Refresh-token rotation in the supplied implementation must be made atomic/conditional to prevent two concurrent refresh requests from both succeeding. A simple read-then-update is race-prone.
-- Review ZCQL construction and escaping against the current Catalyst SDK; do not assume string escaping alone is sufficient for all inputs.
-- Validate CSRF, cookie flags, CORS origins, and mobile-vs-browser token handling in real integration tests.
-- Add startup validation for required secrets and production-safe error/log handling.
-- The included tests cover token primitives only; they do not prove Catalyst auth, database behavior, tenant isolation, or concurrency safety.
-- Confirm all Catalyst SDK methods and AppSail configuration against the current Catalyst docs and an actual non-production deployment.
+- Refresh-token rotation now uses a conditional ZCQL `UPDATE` against the stored refresh-token hash, followed by a read-back check, so only one rotation from a given hash should win. This relies on Catalyst applying the `WHERE` condition atomically; verify this with concurrent requests against a non-production project before enabling the flow.
+- ZCQL values are restricted to identifier characters before interpolation. Query syntax, ROWID comparisons, table names, and returned row shapes still require verification against the actual Catalyst schema and a non-production project.
+- Automated tests cover token/session claim checks, conditional refresh rotation logic, CSRF, ZCQL input rejection and pagination, production configuration, and Express security headers. They do not prove Catalyst authentication, database behavior, tenant data isolation, or cross-instance concurrency safety.
+- The backend uses Zoho's modular `@zcatalyst/auth` and `@zcatalyst/datastore` packages. Unit tests cover the initialization adapter and repository behavior, but Catalyst request-context authentication and AppSail behavior must still be confirmed in a non-production integration.
+- The deprecated `zcatalyst-sdk-node` package has been replaced by Zoho's modular SDK. Live Catalyst request-context, database, and concurrency behavior still require verification in a non-production project.
+- Startup validation, generic error responses, cookie/CORS checks, and basic security headers are implemented; production deployment settings and operational logging still need review.
 
 ## Scope
 
