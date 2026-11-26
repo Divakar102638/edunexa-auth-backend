@@ -1,0 +1,12 @@
+{
+  "stack": "node24",
+  "command": "node server.js",
+  "memory": 256,
+  "catalyst_auth": true
+}
+
+catalyst_auth: true is needed so the incoming request context can carry
+authenticated Catalyst user context to AppSail for getCurrentUser(). This
+follows Catalyst’s guidance to initialize the SDK with the incoming request and
+run operations in the requesting user’s context. (docs.catalyst.zoho.com
+[https://docs.catalyst.zoho.com/en/sdk/nodejs/v2/serverless/appsail/implement-catalyst-sdk/?utm_source=openai])
